@@ -124,19 +124,58 @@ def fetch_news_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
     scores: List[float] = []
 
     for item in news_items[:25]:
-        # yfinance news dict keys vary by version
-        title   = item.get("title", "") or item.get("headline", "")
-        summary = item.get("summary", "") or item.get("description", "")
+        # yfinance ≥ 1.4 wraps everything inside item["content"]
+        # Older versions put keys directly on item — support both.
+        content = item.get("content") or item          # dict
+
+        title   = (
+            content.get("title")
+            or content.get("headline")
+            or item.get("title")
+            or ""
+        )
+        summary = (
+            content.get("summary")
+            or content.get("description")
+            or item.get("summary")
+            or ""
+        )
+
+        # Strip accidental HTML tags (safety net)
+        import re as _re
+        title   = _re.sub(r"<[^>]+>", "", title).strip()
+        summary = _re.sub(r"<[^>]+>", "", summary).strip()
+
+        if not title:
+            continue
+
         combined = f"{title}. {summary}"[:512]
         score = _score_text(combined)
         scores.append(score)
+
+        # Provider/source name
+        provider = content.get("provider") or {}
+        source   = (
+            provider.get("displayName")
+            or item.get("publisher")
+            or "Yahoo Finance"
+        )
+
+        # URL
+        url = (
+            (content.get("canonicalUrl") or {}).get("url")
+            or (content.get("clickThroughUrl") or {}).get("url")
+            or item.get("link")
+            or ""
+        )
+
         articles.append(
             {
-                "source": item.get("publisher", "Yahoo Finance"),
+                "source": source,
                 "title":  title[:120],
                 "score":  score,
                 "label":  _label(score),
-                "url":    item.get("link", ""),
+                "url":    url,
             }
         )
 
