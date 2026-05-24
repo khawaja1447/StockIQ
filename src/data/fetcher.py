@@ -90,38 +90,52 @@ def fetch_price_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     """
     Download OHLCV daily data for *ticker* using yfinance.
 
-    Returns a clean DataFrame with columns [Open, High, Low, Close, Volume]
-    indexed by UTC date, or an empty DataFrame on failure.
-    """
-    try:
-        raw = yf.download(
-            ticker,
-            period=period,
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-            actions=False,
-        )
-        if raw.empty:
-            return pd.DataFrame()
+    Uses Ticker.history() — returns clean flat columns in all yfinance versions.
+    Falls back to yf.download() if history() fails.
 
-        # yfinance ≥ 0.2.x sometimes returns MultiIndex columns for single tickers
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
+    Returns a clean DataFrame with columns [Open, High, Low, Close, Volume]
+    indexed by date, or an empty DataFrame on failure.
+    """
+    def _clean(df: pd.DataFrame) -> pd.DataFrame:
+        """Normalise columns and dtypes."""
+        # Flatten MultiIndex if present (yf.download in 1.4+)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
         required = {"Open", "High", "Low", "Close", "Volume"}
-        if not required.issubset(set(raw.columns)):
+        if not required.issubset(set(df.columns)):
             return pd.DataFrame()
 
-        df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df.index = pd.to_datetime(df.index)
-        df = df.sort_index().dropna()
-        # Ensure numeric dtypes
-        df = df.apply(pd.to_numeric, errors="coerce").dropna()
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        # Strip timezone so index is plain dates
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df = df.sort_index()
+        df = df.apply(pd.to_numeric, errors="coerce")
+        df = df.dropna()
         return df
 
+    # ── Primary: Ticker.history() — clean flat columns every time ──
+    try:
+        raw = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+        if not raw.empty:
+            result = _clean(raw)
+            if not result.empty:
+                return result
     except Exception:
-        return pd.DataFrame()
+        pass
+
+    # ── Fallback: yf.download() ────────────────────────────────────
+    try:
+        raw = yf.download(ticker, period=period, interval="1d",
+                          progress=False, auto_adjust=True)
+        if not raw.empty:
+            result = _clean(raw)
+            if not result.empty:
+                return result
+    except Exception:
+        pass
+
+    return pd.DataFrame()
 
 
 # ──────────────────────────────────────────────────────────────────

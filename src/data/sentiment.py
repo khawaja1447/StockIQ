@@ -107,7 +107,7 @@ def fetch_reddit_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
 # Yahoo Finance News (via yfinance — no key needed)
 # ──────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)   # 15-min TTL for news freshness
 def fetch_news_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
     """
     Fetch recent news headlines for *ticker* from Yahoo Finance.
