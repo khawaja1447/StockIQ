@@ -598,6 +598,160 @@ with tab_predict:
             f"({tech_prob*100:.1f}%) → **final {prob*100:.1f}%**"
         )
 
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════
+    # TRADE PLANNER — optimal exit prediction
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### 📐 Trade Planner — If you buy now, when should you sell?")
+    st.caption(
+        "Multi-horizon price projection using signal-decay modelling, historical volatility, "
+        "and ATR-based technical targets. Not financial advice."
+    )
+
+    with st.spinner("Computing optimal exit window…"):
+        exit_data = predictor.predict_exit(df_full, sentiment_score=sent_score)
+
+    entry       = exit_data["entry"]
+    sl          = exit_data["stop_loss"]
+    atr         = exit_data["atr"]
+    opt_days    = exit_data["opt_days"]
+    opt_price   = exit_data["opt_price"]
+    opt_ret     = exit_data["opt_ret_pct"]
+    opt_prob    = exit_data["opt_probability"]
+    rr          = exit_data["risk_reward"]
+    horizons    = exit_data["horizons"]
+    resistances = exit_data["resistances"]
+
+    # ── Key metrics row ────────────────────────────────────────────
+    tp_col, sl_col, rr_col, prob_col = st.columns(4)
+    tp_col.metric(  "Optimal Exit",  f"~{opt_days} days",   f"+{opt_ret:.1f}% expected")
+    sl_col.metric(  "Stop Loss",     f"${sl:,.2f}",         f"{(sl/entry-1)*100:.1f}%")
+    rr_col.metric(  "Risk / Reward", f"{rr:.2f}×",
+                    "Good" if rr >= 2 else ("Fair" if rr >= 1 else "Poor"))
+    prob_col.metric("Win Probability", f"{opt_prob*100:.1f}%", f"at day {opt_days}")
+
+    # ── Price projection fan chart ─────────────────────────────────
+    st.markdown("#### Price Projection Fan")
+
+    # Build continuous days for smooth lines
+    all_days   = list(range(0, 31))
+    import math
+    daily_vol  = exit_data["daily_vol"]
+    mean_ret   = exit_data["mean_daily_ret"]
+
+    exp_line   = [entry * ((1 + mean_ret) ** d) for d in all_days]
+    upper_90   = [entry * math.exp( 1.65 * daily_vol * math.sqrt(max(d,0.01))) for d in all_days]
+    lower_90   = [entry * math.exp(-1.65 * daily_vol * math.sqrt(max(d,0.01))) for d in all_days]
+    upper_50   = [entry * math.exp( 0.67 * daily_vol * math.sqrt(max(d,0.01))) for d in all_days]
+    lower_50   = [entry * math.exp(-0.67 * daily_vol * math.sqrt(max(d,0.01))) for d in all_days]
+
+    fan_fig = go.Figure()
+
+    # 90% band (outer, faint)
+    fan_fig.add_trace(go.Scatter(
+        x=all_days + all_days[::-1],
+        y=upper_90 + lower_90[::-1],
+        fill="toself", fillcolor="rgba(0,212,255,0.06)",
+        line=dict(color="rgba(0,0,0,0)"), name="90% range", showlegend=True,
+    ))
+    # 50% band (inner, stronger)
+    fan_fig.add_trace(go.Scatter(
+        x=all_days + all_days[::-1],
+        y=upper_50 + lower_50[::-1],
+        fill="toself", fillcolor="rgba(0,212,255,0.13)",
+        line=dict(color="rgba(0,0,0,0)"), name="50% range", showlegend=True,
+    ))
+    # Expected path
+    fan_fig.add_trace(go.Scatter(
+        x=all_days, y=exp_line, name="Expected path",
+        line=dict(color="#00D4FF", width=2),
+    ))
+    # Entry point
+    fan_fig.add_trace(go.Scatter(
+        x=[0], y=[entry], name="Entry",
+        mode="markers",
+        marker=dict(size=12, color="#F0B429", symbol="circle"),
+    ))
+    # Optimal exit marker
+    fan_fig.add_trace(go.Scatter(
+        x=[opt_days], y=[opt_price], name=f"Optimal exit (day {opt_days})",
+        mode="markers+text",
+        text=[f" Day {opt_days}: ${opt_price:,.2f}"],
+        textposition="top right",
+        textfont=dict(color="#3fb950", size=12),
+        marker=dict(size=14, color="#3fb950", symbol="star"),
+    ))
+    # Stop loss line
+    fan_fig.add_hline(
+        y=sl, line_dash="dash", line_color="#FF4B4B", opacity=0.7,
+        annotation_text=f"Stop Loss ${sl:,.2f}",
+        annotation_font_color="#FF4B4B",
+    )
+    # Resistance levels
+    level_colors = ["#F0B429", "#A78BFA", "#FB923C", "#34D399", "#F472B6", "#60A5FA"]
+    for i, (name, lvl) in enumerate(list(resistances.items())[:4]):
+        if lvl < entry * 1.5:   # don't plot crazy-distant levels
+            fan_fig.add_hline(
+                y=lvl, line_dash="dot",
+                line_color=level_colors[i % len(level_colors)], opacity=0.55,
+                annotation_text=f"{name} ${lvl:,.2f}",
+                annotation_font_color=level_colors[i % len(level_colors)],
+                annotation_position="right",
+            )
+
+    fan_fig.update_layout(**cl(
+        height=420,
+        xaxis_title="Days from now",
+        yaxis_title="Price (USD)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(l=0, r=120, t=40, b=0),
+    ))
+    st.plotly_chart(fan_fig, use_container_width=True)
+
+    # ── Horizon table ──────────────────────────────────────────────
+    st.markdown("#### Day-by-Day Outlook")
+
+    def _row_style(row):
+        if row["days"] == opt_days:
+            return ["background-color: rgba(63,185,80,0.15)"] * len(row)
+        return [""] * len(row)
+
+    display_h = horizons.copy()
+    display_h["Win Prob"]     = (display_h["p_profit"] * 100).map("{:.1f}%".format)
+    display_h["Exp. Price"]   = display_h["exp_price"].map("${:,.2f}".format)
+    display_h["Exp. Return"]  = display_h["exp_ret_pct"].map("{:+.2f}%".format)
+    display_h["Upper (90%)"]  = display_h["upper_90"].map("${:,.2f}".format)
+    display_h["Lower (90%)"]  = display_h["lower_90"].map("${:,.2f}".format)
+    display_h = display_h.rename(columns={"days": "Day"})
+
+    st.dataframe(
+        display_h[["Day","Win Prob","Exp. Price","Exp. Return","Upper (90%)","Lower (90%)"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ── Take-profit levels ─────────────────────────────────────────
+    st.markdown("#### Take-Profit Targets")
+    tp_rows = []
+    for name, lvl in exit_data["all_levels"].items():
+        dist_pct = (lvl - entry) / entry * 100
+        above    = lvl > entry
+        tp_rows.append({
+            "Level":      name,
+            "Price":      f"${lvl:,.2f}",
+            "Distance":   f"{dist_pct:+.2f}%",
+            "Status":     "Above entry ✓" if above else "Below entry (resistance broken)",
+        })
+    st.dataframe(pd.DataFrame(tp_rows), use_container_width=True, hide_index=True)
+
+    st.markdown(
+        f"<p style='color:#8892A4;font-size:0.78rem'>"
+        f"ATR(14) = ${atr:.2f} · Daily vol = {daily_vol*100:.2f}% · "
+        f"Mean daily return = {mean_ret*100:.3f}%</p>",
+        unsafe_allow_html=True,
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════
 # TAB 3 — SENTIMENT
