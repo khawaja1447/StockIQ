@@ -27,6 +27,11 @@ from src.data.fetcher   import (
 from src.data.sentiment  import get_combined_sentiment
 from src.features.engineer import build_features
 from src.models.predictor  import StockPredictor
+from src.dqn_signals import (
+    cached_btc_signal, cached_signal_history,
+    list_checkpoints, default_checkpoint, checkpoint_label,
+    SIGNAL_ENGINE_AVAILABLE, ENGINE_ERROR,
+)
 
 # ──────────────────────────────────────────────────────────────────
 # Page Config
@@ -168,6 +173,10 @@ CHART_LAYOUT = dict(
     hovermode     = "x unified",
 )
 
+def cl(**overrides) -> dict:
+    """Merge CHART_LAYOUT with per-chart overrides — overrides always win."""
+    return {**CHART_LAYOUT, **overrides}
+
 
 def build_candlestick_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
     """Interactive OHLCV candlestick + volume chart."""
@@ -218,13 +227,12 @@ def build_candlestick_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
         row=2, col=1,
     )
 
-    fig.update_layout(
-        **CHART_LAYOUT,
+    fig.update_layout(**cl(
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         xaxis_rangeslider_visible=False,
         height=520,
-    )
+    ))
     fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
     fig.update_yaxes(title_text="Volume",      row=2, col=1)
     return fig
@@ -247,11 +255,7 @@ def build_rsi_chart(df: pd.DataFrame) -> go.Figure:
         line=dict(color="#7ED321", width=1.8),
         fill="tozeroy", fillcolor="rgba(126,211,33,0.06)",
     ))
-    fig.update_layout(
-        **CHART_LAYOUT,
-        yaxis_range=[0, 100], height=220,
-        yaxis_title="RSI",
-    )
+    fig.update_layout(**cl(yaxis_range=[0, 100], height=220, yaxis_title="RSI"))
     return fig
 
 
@@ -278,7 +282,7 @@ def build_macd_chart(df: pd.DataFrame) -> go.Figure:
         x=df.index, y=sig_line, name="Signal",
         line=dict(color="#FF4B4B", width=1.5, dash="dot"),
     ))
-    fig.update_layout(**CHART_LAYOUT, yaxis_title="MACD", height=220)
+    fig.update_layout(**cl(yaxis_title="MACD", height=220))
     return fig
 
 
@@ -294,8 +298,7 @@ def build_fear_greed_chart(hist: pd.DataFrame) -> go.Figure:
         line=dict(color="#00D4FF", width=2),
         name="Fear & Greed",
     ))
-    fig.update_layout(**CHART_LAYOUT, yaxis_range=[0, 100], height=200,
-                      yaxis_title="Index")
+    fig.update_layout(**cl(yaxis_range=[0, 100], height=200, yaxis_title="Index"))
     return fig
 
 
@@ -316,13 +319,12 @@ def build_shap_bar(shap_vals: np.ndarray, feature_names: list[str]) -> go.Figure
         orientation="h",
         marker_color=colours,
     ))
-    fig.update_layout(
-        **CHART_LAYOUT,
+    fig.update_layout(**cl(
         height=500,
         xaxis_title="SHAP value (impact on prediction)",
         yaxis_title=None,
         title="Feature Impact on Today's Prediction",
-    )
+    ))
     return fig
 
 
@@ -445,8 +447,8 @@ st.divider()
 # Tabs
 # ──────────────────────────────────────────────────────────────────
 
-tab_overview, tab_predict, tab_sentiment, tab_explain = st.tabs([
-    "📊 Overview", "🎯 Prediction", "💬 Sentiment", "🔍 Explainability"
+tab_overview, tab_predict, tab_sentiment, tab_explain, tab_dqn = st.tabs([
+    "📊 Overview", "🎯 Prediction", "💬 Sentiment", "🔍 Explainability", "🤖 DQN Signal"
 ])
 
 
@@ -800,16 +802,306 @@ with tab_explain:
             color="importance",
             color_continuous_scale=["#2D3748", "#00D4FF"],
         )
-        fi_fig.update_layout(
-            **CHART_LAYOUT,
+        fi_fig.update_layout(**cl(
             height=500,
             showlegend=False,
             coloraxis_showscale=False,
             xaxis_title="Importance (Gain)",
             yaxis_title=None,
-        )
+        ))
         fi_fig.update_yaxes(categoryorder="total ascending")
         st.plotly_chart(fi_fig, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TAB 5 — DQN SIGNAL  (BTC only)
+# ═══════════════════════════════════════════════════════════════════
+
+with tab_dqn:
+
+    is_btc = ticker == "BTC-USD"
+
+    if not is_btc:
+        st.info("🤖 DQN signals are only available for **BTC-USD**. Switch to BTC in the sidebar.")
+        st.stop()
+
+    if not SIGNAL_ENGINE_AVAILABLE:
+        st.error(f"Signal engine could not be loaded: `{ENGINE_ERROR}`")
+        st.stop()
+
+    # ── Controls ───────────────────────────────────────────────────
+    st.markdown("### 🤖 DQN Trading Signal — Live BTC/USDT")
+    st.caption(
+        "⚠️ **Research / paper-trading only.** Signals come from a reinforcement-learning "
+        "agent trained in simulation. Do not use for real-money trading without thorough "
+        "independent validation."
+    )
+
+    checkpoints = list_checkpoints()
+    if not checkpoints:
+        st.warning("No trained checkpoints found in Trading-Bot/checkpoints/. Train a model first.")
+        st.stop()
+
+    col_ckpt, col_ivl = st.columns([3, 1])
+    with col_ckpt:
+        ckpt_labels = [checkpoint_label(p) for p in checkpoints]
+        sel_idx     = st.selectbox("Checkpoint (newest first)", range(len(checkpoints)),
+                                   format_func=lambda i: ckpt_labels[i])
+        ckpt_path   = checkpoints[sel_idx]
+    with col_ivl:
+        interval = st.selectbox("Candle interval", ["1h", "4h", "15m", "5m", "1m"], index=0)
+
+    st.caption(f"Model file: `{ckpt_path}`")
+
+    # ── Fetch DQN signal ───────────────────────────────────────────
+    with st.spinner("Running DQN inference…"):
+        sig = cached_btc_signal(ckpt_path, interval)
+
+    if sig is None:
+        st.error("Could not fetch signal — check checkpoint path and internet connection.")
+        st.stop()
+
+    if "_error" in sig:
+        st.error(f"Inference error: `{sig['_error']}`")
+        st.stop()
+
+    dqn_action = sig["action"]
+    dqn_conf   = sig["confidence"]          # 0–1
+    price      = sig["price"]
+    ts         = sig["timestamp"]
+    q_probs    = sig["q_probs"]             # [hold, buy, sell]
+
+    # ── Fetch ML prediction + sentiment for BTC-USD ────────────────
+    with st.spinner("Loading ML prediction & sentiment for fusion…"):
+        btc_sent      = get_combined_sentiment("BTC-USD")
+        btc_predictor = get_predictor("BTC-USD")
+        if btc_predictor is not None:
+            btc_ml = btc_predictor.predict(
+                df_full, sentiment_score=btc_sent.get("score", 0.0)
+            )
+        else:
+            btc_ml = None
+
+    # ── Signal Fusion ──────────────────────────────────────────────
+    # Normalise each signal to [-1, +1] then weighted-average
+
+    # 1. DQN  →  ±confidence
+    dqn_score = (
+        dqn_conf  if dqn_action == "BUY"  else
+        -dqn_conf if dqn_action == "SELL" else 0.0
+    )
+
+    # 2. ML   →  (P_up − 0.5) × 2
+    ml_score = (btc_ml["probability"] - 0.5) * 2 if btc_ml else 0.0
+
+    # 3. Sentiment (already in [-1, +1])
+    sent_score = btc_sent.get("score", 0.0) if btc_sent["available"] else 0.0
+
+    W_DQN, W_ML, W_SENT = 0.50, 0.35, 0.15
+    fused = float(np.clip(
+        dqn_score * W_DQN + ml_score * W_ML + sent_score * W_SENT,
+        -1.0, 1.0,
+    ))
+
+    fused_action = "BUY" if fused > 0.15 else ("SELL" if fused < -0.15 else "HOLD")
+    fused_conf   = 50 + abs(fused) * 50     # maps [0,1] → [50,100]
+
+    # Agreement across the three signals
+    signs = [np.sign(dqn_score), np.sign(ml_score), np.sign(sent_score)]
+    n_pos = sum(s > 0 for s in signs)
+    n_neg = sum(s < 0 for s in signs)
+    if n_pos == 3:
+        agreement, agr_color = "ALL 3 AGREE — BUY",  "#3fb950"
+    elif n_neg == 3:
+        agreement, agr_color = "ALL 3 AGREE — SELL", "#f78166"
+    elif n_pos == 2:
+        agreement, agr_color = "2/3 LEAN BUY",       "#7ED321"
+    elif n_neg == 2:
+        agreement, agr_color = "2/3 LEAN SELL",      "#F0A500"
+    else:
+        agreement, agr_color = "SIGNALS MIXED",      "#8b949e"
+
+    # ── Row 1: raw signal cards side-by-side ──────────────────────
+    st.markdown("#### Raw Signals")
+    rc1, rc2, rc3 = st.columns(3)
+
+    dqn_col  = {"BUY": "#3fb950", "SELL": "#f78166", "HOLD": "#8b949e"}[dqn_action]
+    ml_dir   = btc_ml["direction"] if btc_ml else "N/A"
+    ml_col   = "#00D4FF" if ml_dir == "UP" else "#FF4B4B"
+    ml_pct   = btc_ml["confidence"] if btc_ml else 0.0
+    sent_lbl = btc_sent.get("label", "Neutral")
+    sent_col = {"Positive": "#00D4FF", "Negative": "#FF4B4B"}.get(sent_lbl, "#F0B429")
+
+    with rc1:
+        st.markdown(f"""
+        <div style="background:#1A1F2E;border-radius:12px;padding:18px;
+                    border:1px solid {dqn_col};text-align:center">
+            <div style="color:#8892A4;font-size:0.75rem;text-transform:uppercase;
+                        letter-spacing:.05em">DQN Agent</div>
+            <div style="color:{dqn_col};font-size:2rem;font-weight:800;margin:6px 0">
+                {dqn_action}</div>
+            <div style="color:#C0C8D4;font-size:0.85rem">
+                Confidence {dqn_conf*100:.1f}%</div>
+            <div style="color:#8892A4;font-size:0.75rem;margin-top:4px">
+                score {dqn_score:+.2f} · weight 50%</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with rc2:
+        st.markdown(f"""
+        <div style="background:#1A1F2E;border-radius:12px;padding:18px;
+                    border:1px solid {ml_col};text-align:center">
+            <div style="color:#8892A4;font-size:0.75rem;text-transform:uppercase;
+                        letter-spacing:.05em">ML Ensemble</div>
+            <div style="color:{ml_col};font-size:2rem;font-weight:800;margin:6px 0">
+                {"▲ " if ml_dir=="UP" else "▼ "}{ml_dir}</div>
+            <div style="color:#C0C8D4;font-size:0.85rem">
+                Confidence {ml_pct:.1f}%</div>
+            <div style="color:#8892A4;font-size:0.75rem;margin-top:4px">
+                score {ml_score:+.2f} · weight 35%</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with rc3:
+        st.markdown(f"""
+        <div style="background:#1A1F2E;border-radius:12px;padding:18px;
+                    border:1px solid {sent_col};text-align:center">
+            <div style="color:#8892A4;font-size:0.75rem;text-transform:uppercase;
+                        letter-spacing:.05em">Sentiment</div>
+            <div style="color:{sent_col};font-size:2rem;font-weight:800;margin:6px 0">
+                {sent_lbl}</div>
+            <div style="color:#C0C8D4;font-size:0.85rem">
+                Score {sent_score:+.2f}</div>
+            <div style="color:#8892A4;font-size:0.75rem;margin-top:4px">
+                Reddit + News · weight 15%</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Row 2: Fused consensus card ────────────────────────────────
+    st.markdown("#### AI Consensus Signal")
+    fused_bg = {
+        "BUY":  "linear-gradient(135deg,#0D2137 0%,#0A3D2E 100%);border:2px solid #3fb950",
+        "SELL": "linear-gradient(135deg,#2D0D0D 0%,#3D1515 100%);border:2px solid #f78166",
+        "HOLD": "linear-gradient(135deg,#1A1F2E 0%,#232A3D 100%);border:2px solid #8b949e",
+    }[fused_action]
+    fused_color = {"BUY": "#3fb950", "SELL": "#f78166", "HOLD": "#8b949e"}[fused_action]
+    fused_arrow = {"BUY": "▲", "SELL": "▼", "HOLD": "●"}[fused_action]
+
+    fc1, fc2 = st.columns([1.4, 1])
+    with fc1:
+        st.markdown(f"""
+        <div style="border-radius:16px;padding:28px 32px;text-align:center;
+                    background:{fused_bg}">
+            <div style="font-size:3rem;line-height:1">{fused_arrow}</div>
+            <div style="font-size:2.4rem;font-weight:800;color:{fused_color};margin:6px 0">
+                {fused_action}</div>
+            <div style="font-size:1.05rem;color:#C0C8D4">
+                Fused confidence: <b>{fused_conf:.1f}%</b>
+                &nbsp;·&nbsp; ${price:,.2f}
+            </div>
+            <div style="margin-top:12px;padding:8px 16px;border-radius:8px;
+                        background:rgba(0,0,0,0.3);display:inline-block">
+                <span style="color:{agr_color};font-weight:700;font-size:0.95rem">
+                    {agreement}</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with fc2:
+        # Contribution breakdown bar
+        contrib_fig = go.Figure(go.Bar(
+            x=["DQN (50%)", "ML (35%)", "Sentiment (15%)"],
+            y=[dqn_score * W_DQN * 100,
+               ml_score  * W_ML  * 100,
+               sent_score * W_SENT * 100],
+            marker_color=[
+                "#3fb950" if dqn_score * W_DQN >= 0 else "#f78166",
+                "#3fb950" if ml_score  * W_ML  >= 0 else "#f78166",
+                "#3fb950" if sent_score * W_SENT >= 0 else "#f78166",
+            ],
+            text=[f"{dqn_score*W_DQN*100:+.1f}",
+                  f"{ml_score*W_ML*100:+.1f}",
+                  f"{sent_score*W_SENT*100:+.1f}"],
+            textposition="outside",
+        ))
+        contrib_fig.add_hline(y=0, line_color="#8b949e", line_width=1)
+        contrib_fig.update_layout(**cl(
+            height=280, showlegend=False,
+            title="Weighted contribution to fused score",
+            margin=dict(l=0, r=0, t=36, b=0),
+        ))
+        contrib_fig.update_yaxes(
+            title_text="Score contribution",
+            range=[-55, 55], gridcolor="#1E2433",
+        )
+        st.plotly_chart(contrib_fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Q-value bars ───────────────────────────────────────────────
+    st.markdown("##### DQN Agent — Q-value probabilities")
+    labels = ["HOLD", "BUY", "SELL"]
+    bar_colors = ["#8b949e", "#3fb950", "#f78166"]
+
+    qfig = go.Figure(go.Bar(
+        x=[f"{l}  {p*100:.1f}%" for l, p in zip(labels, q_probs)],
+        y=[p * 100 for p in q_probs],
+        marker_color=bar_colors,
+        text=[f"{p*100:.1f}%" for p in q_probs],
+        textposition="outside",
+    ))
+    qfig.update_layout(**cl(height=260, showlegend=False, margin=dict(l=0, r=0, t=10, b=0)))
+    qfig.update_yaxes(range=[0, 110], title_text="Probability (%)", gridcolor="#1E2433")
+    st.plotly_chart(qfig, use_container_width=True)
+
+    # ── Signal history chart ───────────────────────────────────────
+    st.markdown("##### Signal history — last 60 candles")
+    with st.spinner("Loading signal history…"):
+        hist = cached_signal_history(ckpt_path, interval, n=60)
+
+    if hist is not None and not hist.empty:
+        buys  = hist[hist["action_id"] == 1]
+        sells = hist[hist["action_id"] == 2]
+
+        hfig = go.Figure()
+        hfig.add_trace(go.Scatter(
+            x=hist["timestamp"], y=hist["price"],
+            mode="lines", name="BTC Price",
+            line=dict(color="#8b949e", width=1.4),
+        ))
+        if not buys.empty:
+            hfig.add_trace(go.Scatter(
+                x=buys["timestamp"], y=buys["price"],
+                mode="markers", name="BUY",
+                marker=dict(symbol="triangle-up", size=11, color="#3fb950",
+                            line=dict(width=1, color="#0A3D2E")),
+            ))
+        if not sells.empty:
+            hfig.add_trace(go.Scatter(
+                x=sells["timestamp"], y=sells["price"],
+                mode="markers", name="SELL",
+                marker=dict(symbol="triangle-down", size=11, color="#f78166",
+                            line=dict(width=1, color="#3D1515")),
+            ))
+        hfig.update_layout(**cl(height=380, legend=dict(orientation="h", yanchor="bottom", y=1.02)))
+        hfig.update_yaxes(tickprefix="$", tickformat=",.0f", gridcolor="#1E2433")
+        st.plotly_chart(hfig, use_container_width=True)
+
+    # ── Disclaimer ─────────────────────────────────────────────────
+    st.markdown("""
+    <div style="background:#1A1F2E;border-radius:10px;padding:14px 18px;
+                border-left:4px solid #F0B429;margin-top:8px">
+        <b style="color:#F0B429">⚠️ Important</b><br>
+        <span style="color:#8892A4;font-size:0.85rem">
+        The AI Consensus Signal fuses the DQN RL agent (50%), XGBoost+LightGBM
+        technical ensemble (35%), and NLP sentiment (15%). Higher agreement across
+        all three sources historically correlates with stronger signal quality.
+        This is a research tool — always paper-trade first.
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────────────────────────
