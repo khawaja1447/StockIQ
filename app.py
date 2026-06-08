@@ -796,30 +796,29 @@ with tab_sentiment:
         """, unsafe_allow_html=True)
 
     with c_redd:
-        r_score = sent["reddit_score"]
-        r_label = sent["label"] if sent["available"] else "N/A"
-        r_col   = _chg_color(r_score)
+        st_score = sent.get("social_score", 0.0)
+        st_col   = _chg_color(st_score)
         st.markdown(f"""
         <div class="sent-card">
             <div style="color:#8892A4;font-size:0.78rem;text-transform:uppercase;
-                        letter-spacing:.05em">Reddit Score</div>
-            <div class="sent-score" style="color:{r_col}">{r_score:+.2f}</div>
+                        letter-spacing:.05em">StockTwits</div>
+            <div class="sent-score" style="color:{st_col}">{st_score:+.2f}</div>
             <div style="font-size:0.9rem;color:#8892A4">
-                {len(sent.get('reddit_posts', []))} posts analysed
+                {len(sent.get('social_posts', []))} posts scored
             </div>
         </div>
         """, unsafe_allow_html=True)
 
     with c_news:
-        n_score = sent["news_score"]
-        n_col   = _chg_color(n_score)
+        gn_score = sent.get("news_score", 0.0)
+        gn_col   = _chg_color(gn_score)
         st.markdown(f"""
         <div class="sent-card">
             <div style="color:#8892A4;font-size:0.78rem;text-transform:uppercase;
-                        letter-spacing:.05em">News Score</div>
-            <div class="sent-score" style="color:{n_col}">{n_score:+.2f}</div>
+                        letter-spacing:.05em">Google News</div>
+            <div class="sent-score" style="color:{gn_col}">{gn_score:+.2f}</div>
             <div style="font-size:0.9rem;color:#8892A4">
-                {len(sent.get('news_articles', []))} articles analysed
+                {len(sent.get('news_articles', []))} headlines scored
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -832,54 +831,48 @@ with tab_sentiment:
         st.plotly_chart(build_fear_greed_chart(fg["history"]),
                         use_container_width=True)
 
-    # ── Post feeds ────────────────────────────────────────────────
-    col_r, col_n = st.columns(2)
+    # ── Three-column feed ─────────────────────────────────────────
+    col_st, col_gn, col_yf = st.columns(3)
 
-    with col_r:
-        st.markdown("#### 📢 Reddit Posts")
-        posts = sent.get("reddit_posts", [])
+    def _feed_card(p: dict) -> str:
+        sc   = p["score"]
+        col  = _chg_color(sc)
+        bg   = "#0A3D2E" if sc > 0.05 else ("#2D0D0D" if sc < -0.05 else "#1A1F2E")
+        return (
+            f'<div style="background:{bg};border-radius:8px;padding:10px 14px;'
+            f'margin-bottom:8px;border-left:3px solid {col}">'
+            f'<div style="font-size:0.78rem;color:{col};font-weight:700">'
+            f'{p["label"]}  {sc:+.3f}  ·  {p["source"]}</div>'
+            f'<div style="font-size:0.85rem;color:#C0C8D4;margin-top:3px">'
+            f'{p["title"]}</div></div>'
+        )
+
+    with col_st:
+        st.markdown("#### StockTwits")
+        posts = sent.get("social_posts", [])
         if posts:
-            for p in posts[:10]:
-                score_col = _chg_color(p["score"])
-                label_bg  = "#0A3D2E" if p["score"] > 0.05 else (
-                            "#2D0D0D" if p["score"] < -0.05 else "#1A1F2E")
-                st.markdown(f"""
-                <div style="background:{label_bg};border-radius:8px;
-                            padding:10px 14px;margin-bottom:8px;
-                            border-left:3px solid {score_col}">
-                    <div style="font-size:0.82rem;color:{score_col};font-weight:700">
-                        {p['label']}  {p['score']:+.3f}  ·  {p['source']}
-                    </div>
-                    <div style="font-size:0.88rem;color:#C0C8D4;margin-top:3px">
-                        {p['title']}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+            for p in posts[:8]:
+                st.markdown(_feed_card(p), unsafe_allow_html=True)
         else:
-            st.info("Reddit data unavailable (rate limited — try again in a moment).")
+            st.info("StockTwits unavailable.")
 
-    with col_n:
-        st.markdown("#### 📰 News Headlines")
-        articles = sent.get("news_articles", [])
-        if articles:
-            for a in articles[:10]:
-                score_col = _chg_color(a["score"])
-                label_bg  = "#0A3D2E" if a["score"] > 0.05 else (
-                            "#2D0D0D" if a["score"] < -0.05 else "#1A1F2E")
-                st.markdown(f"""
-                <div style="background:{label_bg};border-radius:8px;
-                            padding:10px 14px;margin-bottom:8px;
-                            border-left:3px solid {score_col}">
-                    <div style="font-size:0.82rem;color:{score_col};font-weight:700">
-                        {a['label']}  {a['score']:+.3f}  ·  {a['source']}
-                    </div>
-                    <div style="font-size:0.88rem;color:#C0C8D4;margin-top:3px">
-                        {a['title']}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+    with col_gn:
+        st.markdown("#### Google News")
+        gn_arts = sent.get("news_articles", [])
+        if gn_arts:
+            for a in gn_arts[:8]:
+                st.markdown(_feed_card(a), unsafe_allow_html=True)
         else:
-            st.info("News data unavailable.")
+            st.info("Google News unavailable.")
+
+    with col_yf:
+        st.markdown("#### Yahoo Finance")
+        yf_arts = sent.get("yahoo_articles", [])
+        if yf_arts:
+            for a in yf_arts[:8]:
+                st.markdown(_feed_card(a), unsafe_allow_html=True)
+        else:
+            st.info("Yahoo Finance unavailable.")
 
 
 # ═══════════════════════════════════════════════════════════════════

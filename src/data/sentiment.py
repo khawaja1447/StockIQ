@@ -1,29 +1,60 @@
 """
 Sentiment analysis module for StockIQ.
 
-Fetches text from two free, no-auth sources:
-  1. Reddit public JSON feed  → hot posts from relevant subreddits
-  2. Yahoo Finance news       → recent headlines via yfinance
+Three free, no-auth data sources:
+  1. StockTwits public API  → trader mood with official Bullish/Bearish labels
+  2. Google News RSS        → mainstream financial news headlines
+  3. Yahoo Finance news     → company-specific news via yfinance
 
-Scores each piece of text with VADER (optimised for short social-media text)
-and returns an aggregate compound score in [-1, +1].
+All scored with VADER NLP. Composite score ∈ [-1, +1].
 """
 
 from __future__ import annotations
 
-import time
+import re
 import requests
+import xml.etree.ElementTree as ET
 import streamlit as st
 import yfinance as yf
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from typing import List, Dict, Tuple
 
-from src.data.fetcher import REDDIT_SUBS
+from src.data.fetcher import ALL_ASSETS
 
 # ──────────────────────────────────────────────────────────────────
 _analyzer = SentimentIntensityAnalyzer()
-_REDDIT_HEADERS = {"User-Agent": "StockIQ/1.0 (research project)"}
-_REDDIT_TIMEOUT = 6   # seconds per subreddit request
+_HEADERS   = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+_TIMEOUT = 8
+
+# Google News search queries per asset
+_GN_QUERIES: Dict[str, str] = {
+    "BTC-USD":   "Bitcoin BTC cryptocurrency price",
+    "ETH-USD":   "Ethereum ETH cryptocurrency price",
+    "BNB-USD":   "BNB Binance coin price",
+    "SOL-USD":   "Solana SOL crypto price",
+    "ADA-USD":   "Cardano ADA crypto price",
+    "XRP-USD":   "XRP Ripple crypto price",
+    "DOGE-USD":  "Dogecoin DOGE price",
+    "AVAX-USD":  "Avalanche AVAX crypto",
+    "MATIC-USD": "Polygon MATIC crypto",
+    "DOT-USD":   "Polkadot DOT crypto",
+    "AAPL":      "Apple AAPL stock earnings",
+    "TSLA":      "Tesla TSLA stock",
+    "NVDA":      "NVIDIA NVDA stock AI chips",
+    "MSFT":      "Microsoft MSFT stock",
+    "AMZN":      "Amazon AMZN stock",
+    "GOOGL":     "Alphabet Google GOOGL stock",
+    "META":      "Meta Platforms META stock",
+    "SPY":       "S&P 500 stock market",
+    "AMD":       "AMD semiconductor stock",
+    "NFLX":      "Netflix NFLX stock",
+}
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -45,75 +76,161 @@ def _label(score: float) -> str:
     return "Neutral"
 
 
+def _st_symbol(ticker: str) -> str:
+    """Convert yfinance ticker to StockTwits symbol (BTC-USD → BTC.X)."""
+    return ticker.replace("-USD", ".X") if ticker.endswith("-USD") else ticker
+
+
 # ──────────────────────────────────────────────────────────────────
-# Reddit (public, no auth)
+# Source 1 — StockTwits
 # ──────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_reddit_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_stocktwits_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
     """
-    Scrape hot posts from relevant subreddits for *ticker*.
+    Fetch the latest 30 messages from StockTwits for *ticker*.
+
+    StockTwits provides official Bullish / Bearish labels set by the poster.
+    When the label is absent, VADER scores the message body instead.
 
     Returns:
-        (aggregate_score, list_of_post_dicts)
-        aggregate_score ∈ [-1, +1]
+        (weighted_score, list_of_message_dicts)
     """
-    subreddits = REDDIT_SUBS.get(ticker, ["investing"])
-    posts: List[Dict] = []
-    scores: List[float] = []
+    symbol = _st_symbol(ticker)
+    url    = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
 
-    for sub in subreddits[:2]:          # max 2 subreddits to avoid rate limits
-        url = f"https://www.reddit.com/r/{sub}/hot.json?limit=30"
-        try:
-            resp = requests.get(url, headers=_REDDIT_HEADERS, timeout=_REDDIT_TIMEOUT)
-            if resp.status_code != 200:
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
+        if resp.status_code != 200:
+            return 0.0, []
+
+        messages = resp.json().get("messages", [])
+        posts: List[Dict] = []
+        scores: List[float] = []
+
+        for msg in messages:
+            body = (msg.get("body") or "").strip()
+            if not body:
                 continue
-            children = resp.json().get("data", {}).get("children", [])
-            for child in children:
-                post = child.get("data", {})
-                title = post.get("title", "")
-                selftext = post.get("selftext", "")
-                combined = f"{title}. {selftext}"[:512]
-                score = _score_text(combined)
-                scores.append(score)
-                posts.append(
-                    {
-                        "source": f"r/{sub}",
-                        "title":  title[:120],
-                        "score":  score,
-                        "label":  _label(score),
-                        "upvotes": post.get("score", 0),
-                        "url":    f"https://reddit.com{post.get('permalink', '')}",
-                    }
-                )
-        except Exception:
-            continue
-        time.sleep(0.3)   # polite crawl delay
 
-    if not scores:
+            # Use official StockTwits label when available — it's a stronger signal
+            st_sent = (msg.get("entities") or {}).get("sentiment") or {}
+            st_basic = st_sent.get("basic", "")
+
+            if st_basic == "Bullish":
+                score = 0.65
+            elif st_basic == "Bearish":
+                score = -0.65
+            else:
+                score = _score_text(body)
+
+            label  = st_basic if st_basic else _label(score)
+            likes  = (msg.get("likes") or {}).get("total", 0)
+            user   = (msg.get("user") or {}).get("username", "trader")
+
+            scores.append(score)
+            posts.append({
+                "source": f"@{user}",
+                "title":  body[:120],
+                "score":  score,
+                "label":  label,
+                "likes":  likes,
+                "url":    f"https://stocktwits.com/symbol/{symbol}",
+            })
+
+        if not scores:
+            return 0.0, []
+
+        # Weighted by likes — popular posts carry more signal
+        weights = [max(p["likes"], 1) for p in posts]
+        total_w = sum(weights)
+        weighted = sum(s * w for s, w in zip(scores, weights)) / total_w
+
+        posts.sort(key=lambda p: abs(p["score"]), reverse=True)
+        return float(weighted), posts[:20]
+
+    except Exception:
         return 0.0, []
 
-    # Weighted average — upvoted posts carry more weight
-    upvotes = [max(p["upvotes"], 1) for p in posts]
-    total_up = sum(upvotes)
-    weighted_score = sum(s * u for s, u in zip(scores, upvotes)) / total_up
-
-    # Sort by absolute sentiment (most opinionated first)
-    posts.sort(key=lambda p: abs(p["score"]), reverse=True)
-    return float(weighted_score), posts[:20]
-
 
 # ──────────────────────────────────────────────────────────────────
-# Yahoo Finance News (via yfinance — no key needed)
+# Source 2 — Google News RSS
 # ──────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=900, show_spinner=False)   # 15-min TTL for news freshness
-def fetch_news_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_google_news_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
     """
-    Fetch recent news headlines for *ticker* from Yahoo Finance.
+    Fetch financial headlines from Google News RSS for *ticker*.
+    No API key, no rate limits.
 
     Returns:
-        (aggregate_score, list_of_headline_dicts)
+        (aggregate_score, list_of_article_dicts)
+    """
+    query   = _GN_QUERIES.get(
+        ticker,
+        f"{ALL_ASSETS.get(ticker, ticker.replace('-USD',''))} {ticker.replace('-USD','')} price",
+    )
+    encoded = requests.utils.quote(query)
+    url     = (
+        f"https://news.google.com/rss/search"
+        f"?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+    )
+
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
+        if resp.status_code != 200:
+            return 0.0, []
+
+        items    = ET.fromstring(resp.content).findall(".//item")
+        articles: List[Dict] = []
+        scores:   List[float] = []
+
+        for item in items[:25]:
+            raw_title = item.findtext("title", "").strip()
+            # Strip "- Publisher" suffix Google appends
+            title = re.sub(r"\s+[-–]\s+[^-–]+$", "", raw_title).strip()
+            title = re.sub(r"<[^>]+>", "", title).strip()   # remove any HTML
+
+            if not title or len(title) < 10:
+                continue
+
+            src_el = item.find("source")
+            source = src_el.text.strip() if src_el is not None else "Google News"
+            link   = item.findtext("link", "")
+
+            score = _score_text(title)
+            scores.append(score)
+            articles.append({
+                "source": source,
+                "title":  title[:120],
+                "score":  score,
+                "label":  _label(score),
+                "url":    link,
+            })
+
+        if not scores:
+            return 0.0, []
+
+        aggregate = float(sum(scores) / len(scores))
+        articles.sort(key=lambda a: abs(a["score"]), reverse=True)
+        return aggregate, articles[:20]
+
+    except Exception:
+        return 0.0, []
+
+
+# ──────────────────────────────────────────────────────────────────
+# Source 3 — Yahoo Finance News (via yfinance)
+# ──────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_yahoo_news_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
+    """
+    Fetch recent headlines for *ticker* from Yahoo Finance via yfinance.
+    Handles both old (flat) and new (nested content) API shapes.
+
+    Returns:
+        (aggregate_score, list_of_article_dicts)
     """
     try:
         news_items = yf.Ticker(ticker).news or []
@@ -121,120 +238,121 @@ def fetch_news_sentiment(ticker: str) -> Tuple[float, List[Dict]]:
         return 0.0, []
 
     articles: List[Dict] = []
-    scores: List[float] = []
+    scores:   List[float] = []
 
-    for item in news_items[:25]:
-        # yfinance ≥ 1.4 wraps everything inside item["content"]
-        # Older versions put keys directly on item — support both.
-        content = item.get("content") or item          # dict
+    for item in news_items[:20]:
+        content = item.get("content") or item
 
         title   = (
-            content.get("title")
-            or content.get("headline")
-            or item.get("title")
-            or ""
+            content.get("title") or content.get("headline")
+            or item.get("title") or ""
         )
         summary = (
-            content.get("summary")
-            or content.get("description")
-            or item.get("summary")
-            or ""
+            content.get("summary") or content.get("description")
+            or item.get("summary") or ""
         )
 
-        # Strip accidental HTML tags (safety net)
-        import re as _re
-        title   = _re.sub(r"<[^>]+>", "", title).strip()
-        summary = _re.sub(r"<[^>]+>", "", summary).strip()
+        title   = re.sub(r"<[^>]+>", "", title).strip()
+        summary = re.sub(r"<[^>]+>", "", summary).strip()
 
         if not title:
             continue
 
-        combined = f"{title}. {summary}"[:512]
-        score = _score_text(combined)
+        score = _score_text(f"{title}. {summary}"[:512])
         scores.append(score)
 
-        # Provider/source name
         provider = content.get("provider") or {}
         source   = (
-            provider.get("displayName")
-            or item.get("publisher")
-            or "Yahoo Finance"
+            provider.get("displayName") or item.get("publisher") or "Yahoo Finance"
         )
-
-        # URL
         url = (
             (content.get("canonicalUrl") or {}).get("url")
             or (content.get("clickThroughUrl") or {}).get("url")
-            or item.get("link")
-            or ""
+            or item.get("link") or ""
         )
 
-        articles.append(
-            {
-                "source": source,
-                "title":  title[:120],
-                "score":  score,
-                "label":  _label(score),
-                "url":    url,
-            }
-        )
+        articles.append({
+            "source": source,
+            "title":  title[:120],
+            "score":  score,
+            "label":  _label(score),
+            "url":    url,
+        })
 
     if not scores:
         return 0.0, []
 
     aggregate = float(sum(scores) / len(scores))
     articles.sort(key=lambda a: abs(a["score"]), reverse=True)
-    return aggregate, articles
+    return aggregate, articles[:20]
 
 
 # ──────────────────────────────────────────────────────────────────
 # Combined Sentiment
 # ──────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_combined_sentiment(ticker: str) -> Dict:
     """
-    Merge Reddit + News sentiment for *ticker*.
+    Merge StockTwits + Google News + Yahoo Finance into one composite score.
 
-    Returns a dict with:
-        score         → weighted composite [-1, +1]
-        label         → "Positive" | "Negative" | "Neutral"
-        reddit_score  → Reddit sub-score
-        news_score    → News sub-score
-        reddit_posts  → list of post dicts
-        news_articles → list of article dicts
-        available     → bool (False if both sources failed)
+    Weights
+    -------
+    Crypto  : StockTwits 45% · Google News 35% · Yahoo Finance 20%
+    Stocks  : StockTwits 30% · Google News 40% · Yahoo Finance 30%
+
+    Returns
+    -------
+    dict with keys:
+        score          composite score [-1, +1]
+        label          "Positive" | "Negative" | "Neutral"
+        social_score   StockTwits sub-score
+        news_score     Google News sub-score
+        yahoo_score    Yahoo Finance sub-score
+        social_posts   StockTwits messages
+        news_articles  Google News articles
+        yahoo_articles Yahoo Finance articles
+        available      bool
     """
-    reddit_score, reddit_posts     = fetch_reddit_sentiment(ticker)
-    news_score,   news_articles    = fetch_news_sentiment(ticker)
+    st_score,  st_posts    = fetch_stocktwits_sentiment(ticker)
+    gn_score,  gn_articles = fetch_google_news_sentiment(ticker)
+    yf_score,  yf_articles = fetch_yahoo_news_sentiment(ticker)
 
-    reddit_ok = len(reddit_posts) > 0
-    news_ok   = len(news_articles) > 0
+    st_ok = len(st_posts)    > 0
+    gn_ok = len(gn_articles) > 0
+    yf_ok = len(yf_articles) > 0
 
-    if reddit_ok and news_ok:
-        # News is more signal-rich for stocks; Reddit for crypto
-        is_crypto = "-USD" in ticker
-        w_reddit  = 0.55 if is_crypto else 0.35
-        w_news    = 1 - w_reddit
-        composite = reddit_score * w_reddit + news_score * w_news
-    elif reddit_ok:
-        composite = reddit_score
-    elif news_ok:
-        composite = news_score
+    is_crypto = "-USD" in ticker
+
+    if is_crypto:
+        W_ST, W_GN, W_YF = 0.45, 0.35, 0.20
     else:
+        W_ST, W_GN, W_YF = 0.30, 0.40, 0.30
+
+    # Normalise weights for available sources only
+    avail_w = (W_ST if st_ok else 0) + (W_GN if gn_ok else 0) + (W_YF if yf_ok else 0)
+    if avail_w == 0:
         return {
             "score": 0.0, "label": "Neutral",
-            "reddit_score": 0.0, "news_score": 0.0,
-            "reddit_posts": [], "news_articles": [],
+            "social_score": 0.0, "news_score": 0.0, "yahoo_score": 0.0,
+            "social_posts": [], "news_articles": [], "yahoo_articles": [],
             "available": False,
         }
 
+    composite = (
+        (st_score * W_ST if st_ok else 0)
+        + (gn_score * W_GN if gn_ok else 0)
+        + (yf_score * W_YF if yf_ok else 0)
+    ) / avail_w
+
     return {
-        "score":         float(composite),
-        "label":         _label(composite),
-        "reddit_score":  float(reddit_score),
-        "news_score":    float(news_score),
-        "reddit_posts":  reddit_posts,
-        "news_articles": news_articles,
-        "available":     True,
+        "score":          float(composite),
+        "label":          _label(composite),
+        "social_score":   float(st_score),
+        "news_score":     float(gn_score),
+        "yahoo_score":    float(yf_score),
+        "social_posts":   st_posts,
+        "news_articles":  gn_articles,
+        "yahoo_articles": yf_articles,
+        "available":      True,
     }
